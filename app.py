@@ -434,16 +434,17 @@ def classify_stock_risk(days_of_cover, current_stock_qty):
 def style_stock_coverage(df: pd.DataFrame):
     def row_style(row):
         risk = row.get("stock_risk")
-        if risk == "Out of stock":
-            color = "background-color: #f8d7da"
-        elif risk == "Critical":
-            color = "background-color: #f8d7da"
-        elif risk == "Warning":
-            color = "background-color: #fff3cd"
-        elif risk == "Healthy":
-            color = "background-color: #d1e7dd"
-        else:
-            color = ""
+    
+    if risk == "Out of stock":
+        color = "background-color: #f8d7da; color: black;"
+    elif risk == "Critical":
+        color = "background-color: #f8d7da; color: black;"
+    elif risk == "Warning":
+        color = "background-color: #fff3cd; color: black;"
+    elif risk == "Healthy":
+        color = "background-color: #d1e7dd; color: black;"
+    else:
+        color = ""
         return [color] * len(row)
 
     display = df.copy()
