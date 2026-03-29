@@ -1,3 +1,4 @@
+
 import io
 from pathlib import Path
 
@@ -110,6 +111,55 @@ def read_fx(file) -> pd.DataFrame:
     df["to_usd"] = pd.to_numeric(df["to_usd"], errors="coerce")
 
     return df.dropna(subset=["currency", "to_usd"]).copy()
+
+
+def read_stock(file) -> pd.DataFrame:
+    if file is None:
+        return pd.DataFrame(columns=["partner_sku", "current_stock_qty", "inventory_snapshot_at"])
+
+    name = getattr(file, "name", "")
+    if str(name).lower().endswith(".csv"):
+        df = pd.read_csv(file)
+    else:
+        df = pd.read_excel(file)
+
+    df = standardize_columns(df)
+
+    required = {"partner_sku", "qty"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Stock file is missing columns: {', '.join(sorted(missing))}")
+
+    df["partner_sku"] = pd.to_numeric(df["partner_sku"], errors="coerce").astype("Int64")
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0)
+
+    if "inventory_snapshot_at" in df.columns:
+        df["inventory_snapshot_at"] = pd.to_datetime(df["inventory_snapshot_at"], errors="coerce")
+    else:
+        df["inventory_snapshot_at"] = pd.NaT
+
+    text_fallbacks = {}
+    for col in ["title", "brand", "sku"]:
+        if col in df.columns:
+            text_fallbacks[col] = lambda s=df[col]: s.dropna().astype(str).iloc[0] if s.dropna().shape[0] else None
+
+    grouped = (
+        df.groupby("partner_sku", dropna=False, as_index=False)
+        .agg(
+            current_stock_qty=("qty", "sum"),
+            inventory_snapshot_at=("inventory_snapshot_at", "max"),
+            stock_title=("title", lambda s: s.dropna().astype(str).iloc[0] if s.dropna().shape[0] else None) if "title" in df.columns else ("qty", "size"),
+            stock_brand=("brand", lambda s: s.dropna().astype(str).iloc[0] if s.dropna().shape[0] else None) if "brand" in df.columns else ("qty", "size"),
+            stock_sku=("sku", lambda s: s.dropna().astype(str).iloc[0] if s.dropna().shape[0] else None) if "sku" in df.columns else ("qty", "size"),
+        )
+    )
+
+    for col in ["stock_title", "stock_brand", "stock_sku"]:
+        if col in grouped.columns:
+            grouped[col] = grouped[col].replace({0: None})
+
+    grouped["inventory_snapshot_at"] = pd.to_datetime(grouped["inventory_snapshot_at"], errors="coerce")
+    return grouped.dropna(subset=["partner_sku"]).copy()
 
 
 @st.cache_data
@@ -311,6 +361,98 @@ def make_mtd_comparison(df: pd.DataFrame):
     }
 
 
+def make_stock_summary(filtered_orders: pd.DataFrame, stock_df: pd.DataFrame, lookback_days: int = 14) -> pd.DataFrame:
+    if stock_df.empty:
+        return pd.DataFrame()
+
+    latest_order_date = filtered_orders["date_dt"].max()
+    if pd.isna(latest_order_date):
+        return pd.DataFrame()
+
+    latest_order_date = pd.Timestamp(latest_order_date)
+    lookback_start = latest_order_date - pd.Timedelta(days=lookback_days - 1)
+
+    recent_orders = filtered_orders[
+        (filtered_orders["date_dt"] >= lookback_start) & (filtered_orders["date_dt"] <= latest_order_date)
+    ].copy()
+
+    sales_lookback = (
+        recent_orders.groupby(["partner_sku", "product_title", "brand"], dropna=False, as_index=False)
+        .agg(orders_last_n_days=("orders", "sum"))
+    )
+
+    stock = stock_df.copy()
+    stock["partner_sku"] = pd.to_numeric(stock["partner_sku"], errors="coerce").astype("Int64")
+    stock["current_stock_qty"] = pd.to_numeric(stock["current_stock_qty"], errors="coerce").fillna(0)
+
+    out = stock.merge(sales_lookback, on="partner_sku", how="left")
+    out["product_title"] = out["product_title"].fillna(out.get("stock_title"))
+    out["brand"] = out["brand"].fillna(out.get("stock_brand"))
+
+    out["orders_last_n_days"] = out["orders_last_n_days"].fillna(0)
+    out["avg_daily_orders"] = out["orders_last_n_days"] / lookback_days
+    out["days_of_cover"] = out["current_stock_qty"] / out["avg_daily_orders"]
+    out.loc[out["avg_daily_orders"] <= 0, "days_of_cover"] = pd.NA
+    out["stock_risk"] = out.apply(
+        lambda row: classify_stock_risk(row.get("days_of_cover"), row.get("current_stock_qty")),
+        axis=1,
+    )
+
+    snapshot_col = pd.to_datetime(out["inventory_snapshot_at"], errors="coerce")
+    out["inventory_snapshot_at"] = snapshot_col.dt.strftime("%Y-%m-%d %H:%M").fillna("")
+
+    cols = [
+        "partner_sku",
+        "stock_sku",
+        "product_title",
+        "brand",
+        "current_stock_qty",
+        "stock_risk",
+        "orders_last_n_days",
+        "avg_daily_orders",
+        "days_of_cover",
+        "inventory_snapshot_at",
+    ]
+    existing_cols = [c for c in cols if c in out.columns]
+    out = out[existing_cols].copy()
+    return out.sort_values(["days_of_cover", "current_stock_qty"], ascending=[True, False], na_position="last")
+
+
+
+def classify_stock_risk(days_of_cover, current_stock_qty):
+    if pd.isna(current_stock_qty) or current_stock_qty <= 0:
+        return "Out of stock"
+    if pd.isna(days_of_cover):
+        return "No recent sales"
+    if days_of_cover < 14:
+        return "Critical"
+    if days_of_cover <= 30:
+        return "Warning"
+    return "Healthy"
+
+
+def style_stock_coverage(df: pd.DataFrame):
+    def row_style(row):
+        risk = row.get("stock_risk")
+        if risk == "Out of stock":
+            color = "background-color: #f8d7da"
+        elif risk == "Critical":
+            color = "background-color: #f8d7da"
+        elif risk == "Warning":
+            color = "background-color: #fff3cd"
+        elif risk == "Healthy":
+            color = "background-color: #d1e7dd"
+        else:
+            color = ""
+        return [color] * len(row)
+
+    display = df.copy()
+    for col in ["avg_daily_orders", "days_of_cover"]:
+        if col in display.columns:
+            display[col] = pd.to_numeric(display[col], errors="coerce").round(1)
+
+    return display.style.apply(row_style, axis=1)
+
 def to_excel_bytes(data: dict) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -321,6 +463,8 @@ def to_excel_bytes(data: dict) -> bytes:
         data["product_metrics"].to_excel(writer, sheet_name="Product Metrics", index=False)
         data["top_gainers"].to_excel(writer, sheet_name="Top Gainers", index=False)
         data["top_decliners"].to_excel(writer, sheet_name="Top Decliners", index=False)
+        data["stock_report"].to_excel(writer, sheet_name="Current Stock", index=False)
+        data["stock_coverage"].to_excel(writer, sheet_name="Stock Coverage", index=False)
         data["missing_cogs"].to_excel(writer, sheet_name="Missing COGS", index=False)
         data["missing_fees"].to_excel(writer, sheet_name="Missing Fees", index=False)
         data["missing_fx"].to_excel(writer, sheet_name="Missing FX", index=False)
@@ -328,15 +472,17 @@ def to_excel_bytes(data: dict) -> bytes:
 
 
 st.title("Noon Sales Dashboard")
-st.caption("USD-only reporting from Noon orders, product reference, and FX tables.")
+st.caption("USD-only reporting from Noon orders, product reference, FX tables, and stock report.")
 
 with st.sidebar:
     st.header("Files")
-    st.write("Upload your 3 data files or keep local auto-load enabled.")
+    st.write("Upload your 4 data files or keep local auto-load enabled.")
     orders_file = st.file_uploader("Orders file", type=["csv", "xlsx"], key="orders")
     ref_file = st.file_uploader("Product reference", type=["csv", "xlsx"], key="ref")
     fx_file = st.file_uploader("FX rates", type=["csv", "xlsx"], key="fx")
+    stock_file = st.file_uploader("Stock report", type=["csv", "xlsx"], key="stock")
     use_sample = st.checkbox("Load local files automatically", value=True)
+    coverage_days = st.number_input("Coverage lookback days", min_value=1, max_value=180, value=14, step=1)
 
 if use_sample and not orders_file:
     orders_file = open_local("Noon Sales.csv")
@@ -344,6 +490,8 @@ if use_sample and not ref_file:
     ref_file = open_local("Product reference.csv")
 if use_sample and not fx_file:
     fx_file = open_local("FX rates.csv")
+if use_sample and not stock_file:
+    stock_file = open_local("Inventory.csv")
 
 if not all([orders_file, ref_file, fx_file]):
     st.info("Upload the orders, product reference, and FX files to start.")
@@ -353,6 +501,7 @@ try:
     orders_df = read_orders(orders_file)
     ref_df = read_reference(ref_file)
     fx_df = read_fx(fx_file)
+    stock_df = read_stock(stock_file) if stock_file else pd.DataFrame()
     model = build_model(orders_df, ref_df, fx_df)
 except Exception as e:
     st.error(str(e))
@@ -420,6 +569,8 @@ product_sales = make_product_sales(filtered)
 product_metrics = make_product_metrics(filtered)
 top_gainers, top_decliners = make_gainers_decliners(filtered)
 mtd = make_mtd_comparison(filtered)
+stock_coverage = make_stock_summary(filtered, stock_df, lookback_days=coverage_days)
+stock_report = stock_df.sort_values("current_stock_qty", ascending=False) if not stock_df.empty else pd.DataFrame()
 
 missing_cogs = filtered[filtered["cogs_aed"].isna()][["partner_sku", "product_title", "brand"]].drop_duplicates()
 missing_fees = filtered[filtered["fee_percent"].isna()][["partner_sku", "product_title", "brand"]].drop_duplicates()
@@ -471,6 +622,8 @@ tabs = st.tabs([
     "Product Orders",
     "Product Sales",
     "Product Metrics",
+    "Current Stock",
+    "Stock Coverage",
     "Top Gainers / Decliners",
     "MTD vs Previous Month",
     "Data Quality",
@@ -492,6 +645,30 @@ with tabs[4]:
     st.dataframe(product_metrics, use_container_width=True)
 
 with tabs[5]:
+    if stock_report.empty:
+        st.info("Upload a stock report to see current stock by SKU.")
+    else:
+        st.dataframe(stock_report, use_container_width=True)
+
+with tabs[6]:
+    if stock_coverage.empty:
+        st.info("Upload a stock report to see stock coverage days.")
+    else:
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("SKUs in stock file", f"{stock_coverage['partner_sku'].nunique():,}")
+        c2.metric("Critical < 14 days", f"{(stock_coverage['stock_risk'] == 'Critical').sum():,}")
+        c3.metric("Warning 14-30 days", f"{(stock_coverage['stock_risk'] == 'Warning').sum():,}")
+        c4.metric("Healthy > 30 days", f"{(stock_coverage['stock_risk'] == 'Healthy').sum():,}")
+        c5.metric("Out of stock", f"{(stock_coverage['stock_risk'] == 'Out of stock').sum():,}")
+
+        st.caption(
+            f"Days of cover = current_stock_qty / (orders in last {coverage_days} days / {coverage_days}). "
+            "Example: 140 orders in 14 days and stock 280 = 28.0 days of cover."
+        )
+        st.markdown("**Risk colors:** red = under 14 days or out of stock, yellow = 14 to 30 days, green = over 30 days.")
+        st.dataframe(style_stock_coverage(stock_coverage), use_container_width=True)
+
+with tabs[7]:
     g1, g2 = st.columns(2)
 
     with g1:
@@ -504,7 +681,7 @@ with tabs[5]:
         st.caption("Last 7 days vs previous 7 days by sales USD")
         st.dataframe(top_decliners, use_container_width=True)
 
-with tabs[6]:
+with tabs[8]:
     if mtd is None:
         st.info("No data available for MTD comparison.")
     else:
@@ -530,7 +707,7 @@ with tabs[6]:
             f"Previous comparison: {mtd['previous_month_start']} to {mtd['previous_same_day']}"
         )
 
-with tabs[7]:
+with tabs[9]:
     d1, d2, d3 = st.columns(3)
     d1.metric("Missing COGS SKUs", f"{missing_cogs['partner_sku'].nunique() if not missing_cogs.empty else 0}")
     d2.metric("Missing Fee SKUs", f"{missing_fees['partner_sku'].nunique() if not missing_fees.empty else 0}")
@@ -561,6 +738,8 @@ excel_bytes = to_excel_bytes({
     "product_metrics": product_metrics,
     "top_gainers": top_gainers,
     "top_decliners": top_decliners,
+    "stock_report": stock_report,
+    "stock_coverage": stock_coverage,
     "missing_cogs": missing_cogs,
     "missing_fees": missing_fees,
     "missing_fx": missing_fx,
